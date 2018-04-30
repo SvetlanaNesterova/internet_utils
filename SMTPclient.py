@@ -4,15 +4,15 @@ import base64
 from socket import *
 
 SERVER_ADDRESSES = {
-    b"yandex": ("smtp.yandex.ru", 465),
-    b"mail": ("smtp.mail.ru", 465),
-    b"rambler": ("smtp.rambler.ru", 465)
+    "yandex": ("smtp.yandex.ru", 465),
+    "mail": ("smtp.mail.ru", 465),
+    "rambler": ("smtp.rambler.ru", 465)
 }
 
 DIRECTORY = "письмо\\"
 LETTER_FILE = DIRECTORY + "letter.txt"
 CONFIG_FILE = DIRECTORY + "config.txt"
-TIMEOUT = 5
+TIMEOUT = 6
 
 
 class Letter:
@@ -77,6 +77,9 @@ def parse_config(config: str):
     to_start = config.find("TO:")
     subject_start = config.find("SUBJECT:")
     attachments_start = config.find("ATTACHMENTS:")
+    if to_start == -1 or subject_start == -1 or attachments_start == -1 \
+            and not (to_start < subject_start < attachments_start):
+        raise ValueError("Incorrect config file")
     to = config[to_start + len("TO:\r\n"):subject_start].split('\r\n')
     subject = config[subject_start + len("SUBJECT:\r\n"):attachments_start]
     attachments = config[attachments_start+len("ATTACHMENTS:\r\n"):].split("\r\n")
@@ -93,12 +96,11 @@ def load_file(file_name):
     return data
 
 
-def parse_server(login: bytes):
-    start = login.find(b'@') + 1
-    if start == 0 or start == 2:
-        print("INCORRECT LOGIN!")
-        sys.exit()
-    return login[start:].split(b'.')[0]
+def check_login_and_parse_server(login: str):
+    m = re.match('([-a-z0-9_.]+)@([-a-z0-9]+)\.([a-z]{2,6})', login)
+    if not m:
+        return False
+    return m.groups()[1]
 
 
 def get_ssl_socket_connection(address):
@@ -110,37 +112,71 @@ def get_ssl_socket_connection(address):
 
 
 def send_recv(sock: socket, command: bytes):
-    sock.send(command)
-    data = sock.recv(1024)
-    print(data)
+    try:
+        sock.send(command)
+        data = sock.recv(1024)
+    except Exception as e:
+        return b"Connection error " + str(e).encode()
     return data
 
 
 class SMTPClient:
-    def __init__(self, login: bytes, password: bytes):
-        self.login = login
-        self.password = password
-        self.server = parse_server(login)
+    def __init__(self, login, password):
+        self.login = login.encode()
+        self.password = password.encode()
+        self.server = check_login_and_parse_server(login)
+        if not self.server:
+            raise Exception("Incorrect login")
+        if self.server not in SERVER_ADDRESSES:
+            raise Exception("Client does not send letters from the mailboxes of this domain")
         self.server_address = SERVER_ADDRESSES[self.server]
         self.sock = get_ssl_socket_connection(self.server_address)
-        print(self.sock.recv(1024))
+        answer = self.sock.recv(1024)
+        if not answer.startswith(b"2"):
+            raise Exception(answer.decode())
         self.greet_server()
+        self.introduce()
+
+    def send_command_sequence(self, commands):
+        i = 0
+        prev_bad_command = -1
+        while i < len(commands):
+            command = commands[i]
+            answer = send_recv(self.sock, command)
+            if answer.startswith(b"4"):
+                if prev_bad_command != i:
+                    prev_bad_command = i
+                    i = 0
+                    continue
+            if not answer.startswith(b"2") and not answer.startswith(b"3"):
+                raise Exception(answer.decode())
+            i += 1
 
     def greet_server(self):
-        send_recv(self.sock, b'EHLO %s\r\n' % self.login)
-        send_recv(self.sock, b"AUTH LOGIN\r\n")
+        command_seq = [
+            b'EHLO %s\r\n' % self.login
+        ]
+        self.send_command_sequence(command_seq)
+
+    def introduce(self):
         encode_login = base64.b64encode(self.login) + b'\r\n'
         encode_password = base64.b64encode(self.password) + b'\r\n'
-        send_recv(self.sock, encode_login)
-        send_recv(self.sock, encode_password)
+        command_seq = [
+            b"AUTH LOGIN\r\n",
+            encode_login,
+            encode_password
+            ]
+        self.send_command_sequence(command_seq)
 
     def send(self, letter):
-        send_recv(self.sock, b"MAIL FROM: <" + self.login + b">\r\n")  # ящик в скобки <>
+        command_seq = [b"MAIL FROM: <" + self.login + b">\r\n"]
         for recipient in letter.recipients:
-            send_recv(self.sock, b"RCPT TO: <" + recipient.encode() + b">\r\n")
+            if recipient:
+                command_seq.append(b"RCPT TO: <" + recipient.encode() + b">\r\n")
         data = letter.generate_letter(self.login)
-        send_recv(self.sock, b"DATA\r\n")
-        send_recv(self.sock, data)
+        command_seq.append(b"DATA\r\n")
+        command_seq.append(data)
+        self.send_command_sequence(command_seq)
 
     def finish_connection(self):
         send_recv(self.sock, b"QUIT\r\n")
@@ -148,13 +184,30 @@ class SMTPClient:
 
 
 def main():
-    login = input("LOGIN: ").encode()
-    login = b"testtesttest100500@yandex.ru"
-    password = input("PASSWORD: ").encode()
-    password = b"12345678901234567890"
-    client = SMTPClient(login, password)
-    letter = get_letter_from_files()
-    client.send(letter)
+    while True:
+        login = input("LOGIN: ")
+        login = "testtesttest100500@yandex.ru"
+        password = input("PASSWORD: ")
+        password = "12345678901234567890"
+        try:
+            client = SMTPClient(login, password)
+        except Exception as e:
+            print(str(e))
+            continue
+        break
+    print("Authentication was successful")
+    try:
+        letter = get_letter_from_files()
+    except Exception as e:
+        print(str(e))
+        return
+    print("Letter was formed")
+    try:
+        client.send(letter)
+    except Exception as e:
+        print(str(e))
+        return
+    print("Letter was sent")
 
 
 if __name__ == "__main__":
